@@ -1,0 +1,221 @@
+﻿// <copyright file="ReportsQueue.cs" company="TestProject">
+// Copyright 2020 TestProject (https://testproject.io)
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+// </copyright>
+
+namespace TestProject.OpenSDK.Internal
+{
+    using System.Collections.Concurrent;
+    using System.Threading;
+    using NLog;
+    using RestSharp;
+    using TestProject.OpenSDK.Exceptions;
+    using TestProject.OpenSDK.Internal.Rest.Messages;
+
+    /// <summary>
+    /// A queue class managing the sending of report items to the Agent in a separate thread.
+    /// </summary>
+    public class ReportsQueue
+    {
+        /// <summary>
+        /// In case of failure during report - attempt maximum 4 times.
+        /// </summary>
+        protected const int MaxReportFailureAttempts = 4;
+
+        /// <summary>
+        /// Queue that will hold the items to be reported.
+        /// </summary>
+        protected BlockingCollection<QueueItem> ReportItems { get; } = new BlockingCollection<QueueItem>();
+
+        /// <summary>
+        /// HTTP client used to send reports to the Agent.
+        /// </summary>
+        protected RestClient Client { get; set; }
+
+        /// <summary>
+        /// A flag that is raised when all attempts submitting a report fail.
+        /// </summary>
+        protected bool StopReports { get; set; } = false;
+
+        /// <summary>
+        /// Maximum amount of time to wait in milliseconds before forcibly terminating the queue.
+        /// </summary>
+        private const int REPORTS_QUEUE_TIMEOUT = 10000;
+
+        /// <summary>
+        /// Thread that will take care of reporting while test execution continues.
+        /// </summary>
+        private Thread reporterThread;
+
+        /// <summary>
+        /// True if the reporting queue is active, false otherwise.
+        /// </summary>
+        private bool running;
+
+        /// <summary>
+        /// Logger instance for this class.
+        /// </summary>
+        private static Logger Logger { get; set; } = LogManager.GetCurrentClassLogger();
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="ReportsQueue"/> class.
+        /// </summary>
+        /// <param name="client">The <see cref="RestClient"/> HTTP client to send reports to the Agent.</param>
+        public ReportsQueue(RestClient client)
+        {
+            this.Client = client;
+            this.reporterThread = new Thread(new ThreadStart(this.Worker));
+            this.reporterThread.IsBackground = true;
+            this.reporterThread.Start();
+        }
+
+        /// <summary>
+        /// Adds a report to the queue.
+        /// </summary>
+        /// <param name="request">The <see cref="RestRequest"/> HTTP request to send to the Agent.</param>
+        /// <param name="report">The report that this HTTP request contains.</param>
+        public void Submit(RestRequest request, Report report)
+        {
+            if (!this.StopReports)
+            {
+                this.ReportItems.Add(new QueueItem(request, report));
+            }
+        }
+
+        /// <summary>
+        /// Sends all remaining items to the Agent and stops the thread.
+        /// </summary>
+        public void Stop()
+        {
+            this.running = false;
+
+            this.ReportItems.Add(new QueueItem(null, null));
+
+            this.ReportItems.CompleteAdding();
+
+            // Wait until all pending items are reported or the timeout has been reached.
+            bool reportingCompleted = SpinWait.SpinUntil(() => this.ReportItems.Count == 0, REPORTS_QUEUE_TIMEOUT);
+
+            if (!reportingCompleted)
+            {
+                Logger.Warn($"There are {this.ReportItems.Count} unreported items left in the queue.");
+            }
+        }
+
+        /// <summary>
+        ///  Handle the report.
+        ///  From version 3.1.0 -> send reports in batches.
+        ///  For lower versions -> Send standalone report.
+        /// </summary>
+        protected virtual void HandleReport()
+        {
+            foreach (QueueItem itemToReport in this.ReportItems.GetConsumingEnumerable(CancellationToken.None))
+            {
+                if (itemToReport.Request == null && itemToReport.Report == null)
+                {
+                    if (this.running)
+                    {
+                        // These nulls are not OK, something went wrong preparing the report/request.
+                        Logger.Error("An empty request and report were submitted to the queue");
+                    }
+
+                    // These nulls are OK, they were added by stop() method on purpose.
+                    return;
+                }
+
+                this.SendReport(itemToReport.Request);
+            }
+        }
+
+        /// <summary>
+        /// Submits a report to the Agent.
+        /// </summary>
+        /// <param name="sendReportsBatchRequest"> Http request to send report to the agent.
+        /// For lower versions than 3.1.0 -> HTTP request retrieved from the queue.
+        /// For versions 3.1.0 and greater -> Build reports batch HTTP request.
+        /// </param>
+        /// <exception>FailedReportException if cannot send report to the agent more than <see cref="MaxReportFailureAttempts"/> attempts.</exception>
+        protected void SendReport(RestRequest sendReportsBatchRequest)
+        {
+            IRestResponse response;
+            int reportAttemptsCount;
+            for (reportAttemptsCount = MaxReportFailureAttempts; reportAttemptsCount > 0; reportAttemptsCount--)
+            {
+                response = this.Client.Execute(sendReportsBatchRequest);
+
+                // If the reports were sent successfully, there is no need to continue to the rest of the code
+                // since it's handling unsuccessful response.
+                if (response != null && response.IsSuccessful)
+                {
+                    return;
+                }
+
+                Logger.Warn($"Agent responded with an unexpected status {response?.StatusCode ?? 0} during the report: {response?.ErrorMessage ?? "No message."}.");
+                Logger.Info($"Attempt to send report again to the Agent. {reportAttemptsCount - 1} more attempts are left.");
+            }
+
+            // In case all attepts to send the report are failed.
+            // If the report has been sent successfully - this code will not execute.
+            Logger.Error($"All {MaxReportFailureAttempts} attempts to send report have failed.");
+            throw new FailedReportException($"All {MaxReportFailureAttempts} attempts to send report have failed.");
+        }
+
+        /// <summary>
+        /// Worker method that polls the queue and waits for and sends new items to report.
+        /// </summary>
+        private void Worker()
+        {
+            this.running = true;
+
+            while (this.running || this.ReportItems.Count > 0)
+            {
+                try
+                {
+                    this.HandleReport();
+                } catch (FailedReportException)
+                {
+                    this.StopReports = true;
+                    Logger.Warn("Reports are disabled due to multiple failed attempts of sending reports to the agent.");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Internal class to keep the HTTP request and contained report together in the queue.
+        /// </summary>
+        public class QueueItem
+        {
+            /// <summary>
+            /// The HTTP request containing the report.
+            /// </summary>
+            public RestRequest Request { get; }
+
+            /// <summary>
+            /// The report that will be sent to the Agent.
+            /// </summary>
+            public Report Report { get; }
+
+            /// <summary>
+            /// Initializes a new instance of the <see cref="QueueItem"/> class.
+            /// </summary>
+            /// <param name="request">The <see cref="RestRequest"/> HTTP request to send to the Agent.</param>
+            /// <param name="report">The report that this HTTP request contains.</param>
+            public QueueItem(RestRequest request, Report report)
+            {
+                this.Request = request;
+                this.Report = report;
+            }
+        }
+    }
+}

@@ -1,0 +1,36 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>net461;netstandard2.0</TargetFrameworks>
+    <Title>SpecFlow Plugin for TestProject OpenSDK</Title>
+	  <Description>Reports SpecFlow-based test runs to TestProject Cloud</Description>
+    <PackageLicenseFile>LICENSE</PackageLicenseFile>
+    <PackageProjectUrl>https://testproject.io/</PackageProjectUrl>
+    <MinClientVersion>4.3.0</MinClientVersion>
+    <Authors>TestProject</Authors>
+    <Version>0.64.4</Version>
+    <Copyright>2020 TestProject (https://testproject.io)</Copyright>
+    <NeutralLanguage>en</NeutralLanguage>
+    <RepositoryType>git</RepositoryType> 
+    <RepositoryUrl>https://github.com/testproject-io/csharp-opensdk</RepositoryUrl>
+    <PackageIconUrl>https://storage-static.testproject.io/templates/TP-Template-Logo-Square.png</PackageIconUrl>
+    <PackageTags>TestProject;Selenium;Appium;OpenSDK;SpecFlow</PackageTags>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\LICENSE" Link="LICENSE">
+      <PackagePath></PackagePath>
+      <Pack>True</Pack>
+    </None>
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="NLog" Version="4.7.13" />
+    <PackageReference Include="SpecFlow" Version="3.9.40" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\TestProject.OpenSDK\TestProject.OpenSDK.csproj" />
+  </ItemGroup>
+
+</Project>
